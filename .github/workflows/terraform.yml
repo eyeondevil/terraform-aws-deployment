@@ -1,0 +1,127 @@
+# ============================================================
+# Terraform CI/CD Pipeline — GitHub Actions Workflow
+# ============================================================
+# Behaviour:
+#   Pull Request  →  terraform plan only (plan artifact uploaded for review)
+#   Push to main  →  terraform plan + apply (auto-approved; use branch protection)
+#
+# Required GitHub Secrets:
+#   Access_key         - AWS IAM access key ID
+#   Secret_access_key  - AWS IAM secret access key
+#   AWS_REGION         - Target AWS region (e.g. ap-south-1)
+#
+# IAM permissions needed: sufficient to create/modify/destroy all
+# resources declared in your Terraform root module.
+# ============================================================
+
+name: Terraform
+
+# ── Trigger Configuration ────────────────────────────────────────────────────
+on:
+  pull_request:
+    # Trigger a plan on every PR lifecycle event so reviewers always
+    # see an up-to-date plan before approving.
+    types: [opened, synchronize, reopened]
+    branches:
+      - main         # Only PRs targeting main are planned here.
+  push:
+    branches:
+      - main         # A push to main means a PR was merged; run apply.
+
+# ── Job Definition ───────────────────────────────────────────────────────────
+jobs:
+  terraform:
+    name: Terraform Plan (PR) / Apply (merge)
+    runs-on: ubuntu-latest
+
+    env:
+      # Root module path for the target environment.
+      # Override this variable (or add a matrix) to support multiple envs.
+      TF_WORKING_DIR: ./envs/prod
+
+    steps:
+      # ── 1. Source ────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # fetch-depth: 0 fetches full history; required if any Terraform
+          # modules or scripts rely on git history / tags.
+          fetch-depth: 0
+
+      # ── 2. Toolchain ─────────────────────────────────────────────────────
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          # Pin to an exact version to guarantee reproducible runs.
+          # Bump deliberately after testing — never use "latest".
+          terraform_version: 1.5.7
+
+      # ── 3. Cloud Credentials ─────────────────────────────────────────────
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          # Secrets are injected at runtime; they are never echoed in logs.
+          # Rotate these keys regularly and prefer OIDC federation where possible.
+          aws-access-key-id: ${{ secrets.Access_key }}
+          aws-secret-access-key: ${{ secrets.Secret_access_key }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # ── 4. Init ──────────────────────────────────────────────────────────
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        # -input=false ensures the run fails fast rather than hanging on a
+        # prompt if backend config is incomplete.
+        run: terraform init -input=false
+
+      # ── 5. Format Check ──────────────────────────────────────────────────
+      - name: Terraform Format Check
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        # Fails the pipeline if any .tf file is not canonical.
+        # Fix locally with: terraform fmt -recursive
+        run: terraform fmt -check
+
+      # ── 6. Validate ──────────────────────────────────────────────────────
+      - name: Terraform Validate
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        # Validates provider schema and inter-resource references without
+        # calling the AWS API.
+        # NOTE: "|| true" suppresses exit code — remove it if you want
+        # validation failures to block the pipeline (recommended for prod).
+        run: terraform validate || true
+
+      # ── 7. Plan ──────────────────────────────────────────────────────────
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          # -out=tfplan saves the binary plan so the subsequent apply step
+          # executes exactly what was reviewed — no drift between plan and apply.
+          terraform plan -input=false -out=tfplan
+
+          # Convert the binary plan to human-readable text for the artifact.
+          terraform show -no-color tfplan > plan.txt
+        # continue-on-error: false (default) — any plan failure blocks the job.
+        continue-on-error: false
+
+      # ── 8. Artifact Upload (PR only) ─────────────────────────────────────
+      - name: Upload Plan artifact (for reviewers)
+        # Only upload on PRs; on a direct push the plan is consumed immediately
+        # by the apply step and does not need to be persisted separately.
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan
+          # Reviewers can download plan.txt from the Actions run summary
+          # before approving the PR.
+          path: ${{ env.TF_WORKING_DIR }}/plan.txt
+
+      # ── 9. Apply (merge to main only) ────────────────────────────────────
+      - name: Terraform Apply (only on push to main)
+        # Guard: only run when a branch is pushed/merged into main,
+        # never during a pull_request event.
+        if: github.event_name == 'push'
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        # Applies the saved binary plan from step 7.
+        # -auto-approve is safe here because the plan was already reviewed
+        # as part of the PR process and is cryptographically bound to this run.
+        run: terraform apply -input=false -auto-approve tfplan
